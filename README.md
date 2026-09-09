@@ -1,13 +1,16 @@
 # Terraform team platform
 
-A Terraform take-home implementation for self-service team S3 resources. A reusable module creates resources for one team at a time; each team owns a declaration file; the repository includes a documented deployment template that uses one remote Terraform state object per team.
+A Terraform take-home implementation for self-service team S3 resources. A reusable module creates resources for one team at a time; each team owns a declaration file. CI runs without AWS. A separate, disabled-by-default deployment workflow uses one remote Terraform state object per team.
 
 ## Architecture
 
-```text
-teams/payments.tfvars  ─┐
-platform/dev.tfvars    ─┼─> live/ root ─> modules/team-resources
-CI state key            ─┘
+```mermaid
+flowchart TD
+  T[Team declaration] --> V[Configuration validation]
+  P[Platform configuration] --> V
+  V --> R[Single-team Terraform root]
+  R --> M[Team resource module]
+  S[Per-team backend key] --> R
 ```
 
 `modules/team-resources/` is the reusable platform module. It creates a team IAM role and the S3 buckets requested by one team.
@@ -16,7 +19,7 @@ CI state key            ─┘
 
 `teams/<team>.tfvars` is owned by the team and declares its identity, approved workload role, and buckets. `platform/dev.tfvars` holds centrally managed account-wide values such as namespace, account ID, and AWS region.
 
-The CI workflow derives the team ID from the filename only to find the declaration and build the state key. For example:
+CI passes the filename stem as `expected_team_name` after all variable files. Terraform validates that `team_name` matches it. This binds resource identity to the team ID used for change detection and state selection. For example:
 
 ```text
 teams/payments.tfvars -> team ID: payments -> state key: teams/payments/terraform.tfstate
@@ -27,7 +30,8 @@ This is deliberately not an all-team Terraform `for_each`: one Terraform executi
 ## Repository layout
 
 ```text
-.github/workflows/terraform.yml       CI: tests, detection, and a commented deployment template
+.github/workflows/terraform.yml       CI: validation, tests, changed-team detection
+.github/workflows/deploy.yml          Optional real plan -> review -> apply workflow
 modules/team-resources/               Reusable S3 and IAM module
   tests/team.tftest.hcl               Module contract tests with mocked AWS
 live/                                 Root configuration for one team execution
@@ -58,6 +62,8 @@ buckets = {
 ```
 
 Every bucket must explicitly declare `visibility = "public"` or `visibility = "private"`; there is no default. The `buckets` map must contain at least one bucket. Each map key is a stable resource identity, so renaming a key can cause Terraform to replace that bucket.
+
+Team files should contain only `team_name`, `trusted_role_arn`, and `buckets`. Terraform validates required visibility, names, nonempty buckets and explicit role ARNs. Platform values load last, so team files cannot override those values. CI supplies `expected_team_name` last to prevent identity/state-key mismatches. For simplicity, no separate HCL parser is used: unknown top-level variables may only produce warnings and extra object attributes may be discarded by Terraform. Variable files are not an access-control boundary.
 
 Example `platform/dev.tfvars`:
 
@@ -94,7 +100,7 @@ brew install hashicorp/tap/terraform
 terraform version
 ```
 
-CI uses Terraform 1.9.8 and AWS provider 5.x. Keep `.terraform-version` and the workflow pin aligned.
+CI uses Terraform 1.9.8 and AWS provider 5.x. Homebrew may install a newer Terraform; use a version manager for an exact local match or deliberately update `.terraform-version` and both workflow pins together. No Python dependencies or separate provisioning scripts are required.
 
 Run from the repository root:
 
@@ -109,12 +115,14 @@ terraform -chdir=live init -backend=false
 terraform -chdir=live validate
 
 terraform -chdir=live test \
+  -var-file=../teams/payments.tfvars \
   -var-file=../platform/dev.tfvars \
-  -var-file=../teams/payments.tfvars
+  -var=expected_team_name=payments
 
 terraform -chdir=live test \
+  -var-file=../teams/fraud.tfvars \
   -var-file=../platform/dev.tfvars \
-  -var-file=../teams/fraud.tfvars
+  -var=expected_team_name=fraud
 ```
 
 Terraform downloads the AWS provider during `init`, but these tests need no AWS credentials and create no AWS resources. Tests use Terraform's `mock_provider "aws" {}` capability.
@@ -123,7 +131,9 @@ Terraform downloads the AWS provider during `init`, but these tests need no AWS 
 
 The module test uses fixed representative inputs for Payments. This lets it assert exact resource names, policy JSON, tags, encryption, versioning, public/private settings, and IAM permissions. It is a module contract test, not a test for a specific live team.
 
-The root test is parameterized. CI runs the same test file using each changed team's actual `.tfvars` file. It verifies the root can instantiate the module from that declaration and that every requested bucket appears in the module output.
+The root test is parameterized. CI runs the same test file using each changed team's actual `.tfvars` file. It verifies exact bucket keys and names, including team, namespace and account, rather than only counting outputs.
+
+Testing stays Terraform-native. There is no separate regression suite for workflow orchestration or PR comment formatting; changes to that logic should be reviewed and exercised in a PR.
 
 Mock tests cover:
 
@@ -138,16 +148,28 @@ Mock tests do not prove AWS API acceptance, effective IAM authorization, account
 
 ## CI/CD
 
-The workflow has four stages:
+The credential-free `terraform.yml` workflow has four jobs:
 
-1. `test` runs formatting, validation, and module mock tests for every pull request and push.
-2. `detect` compares Git changes. A change to `teams/payments.tfvars` selects Payments. A change to shared code under `modules/`, `live/`, `platform/`, or workflow files selects all teams.
+1. `test` runs formatting, Terraform validation and module mock tests.
+2. `detect` validates filenames and compares Git changes. A change to `teams/payments.tfvars` selects Payments. A change under `modules/`, `live/`, `platform/`, or `.github/` selects all teams. Manual dispatch and a first push select all teams.
 3. `mock_team_tests` runs the root mock test for each selected team. This runs on pull requests without AWS credentials.
-4. `deploy_changed_teams` is a commented production deployment template. Enable it only after configuring the AWS backend, GitHub OIDC deployment role, GitHub Environment, and required repository values. When enabled, it runs after a push to `main` or manual dispatch and initializes/applies each selected team using that team's unique backend key.
 
-Teams are distributed over a maximum of 20 CI batches, with a maximum of five batches running concurrently. This avoids GitHub Actions' 256-job matrix limit while remaining workable for 300+ teams.
+4. `comment_plan` updates the mock plan preview comment on same-repository PRs.
 
-When the deployment template is enabled, its loop provides state isolation:
+For mock tests, teams are distributed over at most 20 batches, with five concurrent jobs. This supports 300+ team declarations without changing the module; real deployment throughput has not been benchmarked.
+
+The separate `deploy.yml` workflow is disabled unless the repository variable `TERRAFORM_DEPLOY_ENABLED` is exactly `true`. Both plan and apply jobs also require `refs/heads/main`, including manual dispatch. Its sequence is:
+
+1. Check the entire current configuration and reject a stale commit before obtaining AWS credentials.
+2. Plan **all current teams** sequentially, with independent state keys and saved binary plans. Upload the plans and human-readable `.txt` versions as an artifact bound to the commit and backend settings.
+3. Wait for approval on the `terraform-production` Environment. Review the uploaded plans before approving; the artifact link appears in the plan job summary.
+4. Re-check main and backend settings, then apply the exact saved plans. Do not re-plan after approval. Re-check main between teams; if it advances, stop and run a fresh deployment of main.
+
+Whole-workflow concurrency spans planning, approval and application. There is no deployment matrix sharing a single job-level group. GitHub may replace pending workflow runs; because each surviving deployment reconciles every current team, updates from a skipped intermediate commit remain included. `cancel-in-progress: false` prevents a newer run cancelling a running apply, but does not guarantee delivery of every intermediate commit or prevent manual cancellation/timeouts.
+
+Sequential deployment is intentionally conservative and slower than mock CI. Each job has a six-hour limit; large real installations need measured runtimes, credential lifetimes, durable queues and independent team approvals. A partial apply is possible; re-plan all teams against their latest states to recover. Backend locking still protects against other Terraform clients, and saved plans fail if their state snapshot has become stale.
+
+The deployment loop provides state isolation:
 
 ```bash
 terraform -chdir=live init -reconfigure \
@@ -161,7 +183,7 @@ teams/payments/terraform.tfstate
 teams/fraud/terraform.tfstate
 ```
 
-The commented production template uses a protected GitHub Environment and workflow-level concurrency. The Environment should require a reviewer before Terraform applies changes. `cancel-in-progress: false` ensures GitHub does not cancel a running Terraform apply.
+Existing state keys remain unchanged. This repository targets one account/environment. Before adding another environment, use a distinct backend bucket or an explicitly migrated environment-prefixed key; do not change existing keys casually. `TF_WORKSPACE=default` keeps plan and apply on the same backend workspace.
 
 ## Enabling real AWS deployment
 
@@ -171,17 +193,22 @@ Create or obtain:
 
 - A private, encrypted, versioned S3 state bucket.
 - A DynamoDB lock table with a string partition key named `LockID` for Terraform 1.9.8 locking.
-- A GitHub OIDC provider in AWS and an AWS deployment role trusted only by this repository, protected environment, and intended branch.
-- A deployment role with the needed backend, S3, and IAM permissions. This is separate from each generated team S3 role.
+- A GitHub OIDC provider and two deployment identities: a plan role with infrastructure read/state-read and lock permissions, and an apply role with the required backend/S3/IAM write permissions. Neither is a generated workload role.
+- GitHub Environments named `terraform-plan` and `terraform-production`. Restrict both to `main`; require reviewers on `terraform-production` and disable bypass where available. The YAML alone does not create or enforce these settings.
+- OIDC trust restricted to audience `sts.amazonaws.com` and the respective subject `repo:asherahmed/SumUpTerraform:environment:terraform-plan` or `repo:asherahmed/SumUpTerraform:environment:terraform-production`. Environment subjects do not include a branch, so Environment branch restrictions and workflow guards are also necessary.
 
-Configure the `terraform-production` GitHub Environment:
+Configure these values before deliberately enabling deployment:
 
 | Name | Type | Purpose |
 |---|---|---|
-| `AWS_REGION` | Variable | Deployment region, for example `eu-central-1` |
-| `TF_STATE_BUCKET` | Variable | Existing Terraform-state S3 bucket |
-| `TF_LOCK_TABLE` | Variable | Existing DynamoDB lock table |
-| `TERRAFORM_DEPLOY_ROLE_ARN` | Secret | AWS role GitHub assumes through OIDC |
+| `TERRAFORM_DEPLOY_ENABLED` | Repository variable | Leave unset/false for mock CI; set `true` only after setup and review |
+| `AWS_REGION` | Repository variable | Backend/authentication region; use `eu-central-1` for the supplied configuration |
+| `TF_STATE_BUCKET` | Repository variable | Existing Terraform-state S3 bucket |
+| `TF_LOCK_TABLE` | Repository variable | Existing DynamoDB lock table |
+| `TERRAFORM_PLAN_ROLE_ARN` | `terraform-plan` Environment secret | Plan-only identity |
+| `TERRAFORM_DEPLOY_ROLE_ARN` | `terraform-production` Environment secret | Apply identity |
+
+Use the same backend variables in both jobs and replace placeholder account/workload ARNs before real deployment. Do not override backend settings differently per Environment. Plan artifacts can contain sensitive values: restrict access, do not commit them, and note their three-day retention. Expired/stale plans require a fresh plan and approval. Real AWS access, permissions, locking, and multi-team idempotency still need sandbox verification; mock CI success is not that verification.
 
 In production, restrict deployment identities to the required state prefixes. Separate S3 keys isolate Terraform state operationally, but an over-privileged identity could still read another team's state.
 
@@ -210,6 +237,8 @@ CI blocks deletion or rename of a team declaration. A team is offboarded through
 4. Empty/archive bucket data only through an approved data-handling process; versioned buckets require handling object versions and delete markers.
 5. Apply the approved destroy plan, archive final state/audit evidence, revoke access, then remove the team declaration.
 
+The deletion gate requires an explicitly reviewed exception for that final removal; no automatic destroy or offboarding bypass is provided. Protect main and require the CI check so deletion failures cannot be ignored during merge. The deployment workflow reconciles current declarations only; it never interprets an absent file as permission to delete old resources.
+
 `force_destroy = false` prevents Terraform from silently emptying a nonempty bucket. It does not prevent deletion of an empty bucket, so deployment approval and destructive-plan review remain necessary.
 
 ## References
@@ -218,3 +247,19 @@ CI blocks deletion or rename of a team declaration. A team is offboarded through
 - https://developer.hashicorp.com/terraform/language/tests/mocking
 - https://developer.hashicorp.com/terraform/language/backend/s3
 - https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html
+# PR plan comments
+
+For same-repository pull requests, CI posts and updates one **mock plan preview**
+comment for the affected teams. `terraform test -verbose` shows the planned
+resources using mocked AWS; this is not a live AWS plan and does not compare
+against deployed state. Real saved plans remain in the opt-in deployment workflow.
+
+The comment includes check status and a link to full run output/artifacts. Large
+previews are truncated to fit GitHub's comment limit; full artifacts are retained
+for three days. Failed tests also upload their output, and still fail CI. An older
+commit's run skips commenting if the PR head has moved on.
+
+Only the separate commenting job gets `pull-requests: write`; it does not check out
+or execute repository code or use AWS credentials. Fork PRs skip commenting because
+their tokens are read-only, but still generate previews and artifacts. No
+`pull_request_target` workflow is used.

@@ -1,3 +1,5 @@
+# Fixed representative inputs make exact policy assertions possible without AWS.
+# These are module contract tests; live/tests uses the actual team declarations.
 mock_provider "aws" {}
 
 variables {
@@ -95,6 +97,7 @@ run "resource_contract" {
 }
 
 run "reject_empty_buckets" {
+  # A negative test passes only when the named validation rejects the input.
   command = plan
   variables {
     buckets = {}

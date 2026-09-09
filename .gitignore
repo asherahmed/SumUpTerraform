@@ -8,4 +8,6 @@ crash.*.log
 *.local.hcl
 .env
 .DS_Store
+__pycache__/
+.venv/
 # Commit .terraform.lock.hcl files after initialization.

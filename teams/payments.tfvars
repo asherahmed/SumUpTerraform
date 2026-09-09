@@ -1,4 +1,4 @@
-# Team identity comes from this filename: payments.
+# CI requires team_name to match this filename, tying resources to the state key.
 
 team_name = "payments"
 

@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Required for GitHub Actions OIDC to AWS.
 
 env:
   TF_IN_AUTOMATION: "true"
@@ -56,6 +55,7 @@ jobs:
             const git = (...args) =>
               execFileSync('git', args, { encoding: 'utf8' });
 
+            // NUL delimiters keep filenames intact; preflight rejects invalid IDs.
             const all = git('ls-files', '-z', 'teams/*.tfvars')
               .split('\0')
               .filter(Boolean);
@@ -66,6 +66,7 @@ jobs:
               }
             }
 
+            // Dispatch and a first push reconcile every declaration.
             let selected = all;
 
             if (context.eventName !== 'workflow_dispatch') {
@@ -103,7 +104,7 @@ jobs:
 
                 const shared = changed.some(
                   file =>
-                    /^(modules\/|live\/|platform\/|\.github\/workflows\/)/.test(file) ||
+                    /^(modules\/|live\/|platform\/|\.github\/)/.test(file) ||
                     file === '.terraform-version'
                 );
 
@@ -162,81 +163,108 @@ jobs:
 
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mock-plans"
+          failed=0
 
           while IFS= read -r team; do
             echo "Mock-testing team: $team"
 
-            terraform -chdir=live test \
+            if terraform -chdir=live test -no-color -verbose \
+              -var-file="../teams/$team.tfvars" \
               -var-file="$PLATFORM_CONFIG" \
-              -var-file="../teams/$team.tfvars"
+              -var="expected_team_name=$team" > "$RUNNER_TEMP/mock-plans/$team.txt" 2>&1; then
+              echo "PASS: $team"
+            else
+              failed=1
+              echo "FAIL: $team"
+            fi
+            cat "$RUNNER_TEMP/mock-plans/$team.txt"
           done < <(jq -r '.[]' <<< "$TEAM_BATCH")
+          exit "$failed"
 
-  # deploy_changed_teams:
-  #   needs: [test, detect, mock_team_tests]
+      - name: Upload mock plan previews (including failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mock-plans-${{ matrix.batch }}
+          path: ${{ runner.temp }}/mock-plans/*.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
-  #   # Real AWS deployment never runs for pull requests.
-  #   if: |
-  #     needs.detect.outputs.has_changes == 'true' &&
-  #     (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+  comment_plan:
+    needs: [test, detect, mock_team_tests]
+    # Never use pull_request_target to run a contributor's Terraform with write access.
+    # Fork PR tokens cannot write comments; their previews remain in run artifacts.
+    if: >-
+      always() && !cancelled() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        if: needs.detect.outputs.has_changes == 'true'
+        continue-on-error: true
+        with:
+          pattern: mock-plans-*
+          merge-multiple: true
+          path: mock-plans
 
-  #   runs-on: ubuntu-latest
-
-  #   # Configure this Environment in GitHub with required reviewers.
-  #   environment: terraform-production
-
-  #   # Prevent two deployment runs from reinitializing/applying state concurrently.
-  #   concurrency:
-  #     group: terraform-team-platform-production
-  #     cancel-in-progress: false
-
-  #   strategy:
-  #     fail-fast: false
-  #     max-parallel: 5
-  #     matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
-
-  #   steps:
-  #     - uses: actions/checkout@v4
-
-  #     - uses: hashicorp/setup-terraform@v3
-  #       with:
-  #         terraform_version: 1.9.8
-
-  #     - name: Authenticate to AWS with GitHub OIDC
-  #       uses: aws-actions/configure-aws-credentials@v4
-  #       with:
-  #         role-to-assume: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN }}
-  #         aws-region: ${{ vars.AWS_REGION }}
-
-  #     - name: Plan and apply each team with isolated state
-  #       env:
-  #         TEAM_BATCH: ${{ toJSON(matrix.teams) }}
-  #         STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-  #         LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
-  #         AWS_REGION: ${{ vars.AWS_REGION }}
-
-  #       shell: bash
-
-  #       run: |
-  #         set -euo pipefail
-
-  #         while IFS= read -r team; do
-  #           echo "Deploying team: $team"
-
-  #           terraform -chdir=live init -reconfigure \
-  #             -backend-config="bucket=$STATE_BUCKET" \
-  #             -backend-config="region=$AWS_REGION" \
-  #             -backend-config="key=teams/$team/terraform.tfstate" \
-  #             -backend-config="dynamodb_table=$LOCK_TABLE" \
-  #             -backend-config="encrypt=true"
-
-  #           terraform -chdir=live plan \
-  #             -lock-timeout=5m \
-  #             -var-file="$PLATFORM_CONFIG" \
-  #             -var-file="../teams/$team.tfvars" \
-  #             -out="$RUNNER_TEMP/$team.tfplan"
-
-  #           terraform -chdir=live apply \
-  #             -lock-timeout=5m \
-  #             -auto-approve \
-  #             "$RUNNER_TEMP/$team.tfplan"
-  #         done < <(jq -r '.[]' <<< "$TEAM_BATCH")
+      - name: Create or update the mock plan comment
+        uses: actions/github-script@v7
+        env:
+          DETECTION_RESULT: ${{ needs.detect.result }}
+          HAS_CHANGES: ${{ needs.detect.outputs.has_changes }}
+          TEST_RESULT: ${{ needs.test.result }}
+          MOCK_RESULT: ${{ needs.mock_team_tests.result }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const marker = '<!-- terraform-team-platform-mock-plan -->';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const sha = context.payload.pull_request.head.sha;
+            // A slow older run must not overwrite a newer commit's preview.
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: context.issue.number });
+            if (pr.head.sha !== sha) {
+              core.info('Skipping superseded commit.');
+              return;
+            }
+            let body = `${marker}\n### Terraform mock plan preview\nCommit: \`${sha}\`\n\n`;
+            body += '**Mock AWS only: not a live, state-aware AWS plan. Nothing is deployed.**\n\n';
+            body += `Checks: ${process.env.TEST_RESULT}; mock plans: ${process.env.MOCK_RESULT}.\n\n`;
+            body += `[Full output and downloadable artifacts (3-day retention)](${runUrl})\n\n`;
+            const files = fs.existsSync('mock-plans')
+              ? fs.readdirSync('mock-plans').filter(f => /^[a-z][a-z0-9-]*\.txt$/.test(f)).sort()
+              : [];
+            if (process.env.DETECTION_RESULT !== 'success') {
+              body += 'Team detection failed; no complete preview is available. See the run logs.\n';
+            } else if (process.env.HAS_CHANGES !== 'true') {
+              body += 'No team or shared infrastructure changes detected.\n';
+            } else if (!files.length) {
+              body += 'No preview artifacts were produced. Check initialization and test failures in the run logs.\n';
+            }
+            // Bound the comment well below GitHub's limit even for 300+ teams.
+            // Treat Terraform output as plain text, never executable code or HTML.
+            const escape = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            let shown = 0;
+            for (const file of files) {
+              const output = escape(fs.readFileSync(`mock-plans/${file}`, 'utf8'));
+              const preview = output.slice(0, 6000);
+              const section = `<details><summary>${file.slice(0, -4)}</summary>\n\n<pre>${preview}</pre>\n${output.length > preview.length ? '\nTruncated; see full artifact.\n' : ''}</details>\n\n`;
+              if (body.length + section.length > 55000) break;
+              body += section;
+              shown++;
+            }
+            if (shown < files.length) body += `${files.length - shown} additional team previews are available in the run artifacts.\n`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: context.issue.number, per_page: 100
+            });
+            const previous = comments.find(comment =>
+              comment.user?.login === 'github-actions[bot]' && comment.body?.startsWith(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }

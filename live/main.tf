@@ -1,3 +1,4 @@
+# One invocation manages one team. Iterating all teams here would share one state.
 module "team" {
   source           = "../modules/team-resources"
   team_name        = var.team_name
