@@ -1,0 +1,242 @@
+name: Terraform team platform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # Required for GitHub Actions OIDC to AWS.
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  PLATFORM_CONFIG: ../platform/dev.tfvars
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - run: terraform fmt -check -recursive
+
+      - run: terraform -chdir=modules/team-resources init -backend=false -lockfile=readonly
+      - run: terraform -chdir=modules/team-resources validate
+      - run: terraform -chdir=modules/team-resources test
+
+      - run: terraform -chdir=live init -backend=false -lockfile=readonly
+      - run: terraform -chdir=live validate
+
+  detect:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.teams.outputs.matrix }}
+      has_changes: ${{ steps.teams.outputs.has_changes }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/github-script@v7
+        id: teams
+        with:
+          script: |
+            const { execFileSync } = require('node:child_process');
+
+            const git = (...args) =>
+              execFileSync('git', args, { encoding: 'utf8' });
+
+            const all = git('ls-files', '-z', 'teams/*.tfvars')
+              .split('\0')
+              .filter(Boolean);
+
+            for (const file of all) {
+              if (!/^teams\/[a-z][a-z0-9-]{0,14}[a-z0-9]\.tfvars$/.test(file)) {
+                throw new Error(`Invalid team filename: ${file}`);
+              }
+            }
+
+            let selected = all;
+
+            if (context.eventName !== 'workflow_dispatch') {
+              const base = context.eventName === 'pull_request'
+                ? context.payload.pull_request.base.sha
+                : context.payload.before;
+
+              if (base && !/^0+$/.test(base)) {
+                const deleted = git(
+                  'diff',
+                  '--no-renames',
+                  '--diff-filter=D',
+                  '--name-only',
+                  '-z',
+                  base,
+                  'HEAD',
+                  '--',
+                  'teams/'
+                ).split('\0').filter(Boolean);
+
+                if (deleted.some(file => file.endsWith('.tfvars'))) {
+                  throw new Error(
+                    'Team deletion or rename requires the documented offboarding procedure.'
+                  );
+                }
+
+                const changed = git(
+                  'diff',
+                  '--no-renames',
+                  '--name-only',
+                  '-z',
+                  base,
+                  'HEAD'
+                ).split('\0').filter(Boolean);
+
+                const shared = changed.some(
+                  file =>
+                    /^(modules\/|live\/|platform\/|\.github\/workflows\/)/.test(file) ||
+                    file === '.terraform-version'
+                );
+
+                selected = shared
+                  ? all
+                  : all.filter(file => changed.includes(file));
+              }
+            }
+
+            const teams = selected.map(file => file.slice(6, -7));
+
+            // At most 20 GitHub matrix jobs; each job processes its own batch.
+            const count = Math.min(20, teams.length);
+            const batches = Array.from({ length: count }, () => []);
+
+            teams.forEach((team, index) => {
+              batches[index % count].push(team);
+            });
+
+            core.setOutput(
+              'has_changes',
+              teams.length > 0 ? 'true' : 'false'
+            );
+
+            core.setOutput(
+              'matrix',
+              JSON.stringify({
+                include: batches.map((teams, batch) => ({ batch, teams }))
+              })
+            );
+
+  mock_team_tests:
+    needs: [test, detect]
+    if: needs.detect.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - run: terraform -chdir=live init -backend=false -lockfile=readonly
+
+      - name: Mock-test each changed team
+        env:
+          TEAM_BATCH: ${{ toJSON(matrix.teams) }}
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r team; do
+            echo "Mock-testing team: $team"
+
+            terraform -chdir=live test \
+              -var-file="$PLATFORM_CONFIG" \
+              -var-file="../teams/$team.tfvars"
+          done < <(jq -r '.[]' <<< "$TEAM_BATCH")
+
+  deploy_changed_teams:
+    needs: [test, detect, mock_team_tests]
+
+    # Real AWS deployment never runs for pull requests.
+    if: |
+      needs.detect.outputs.has_changes == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+
+    # Configure this Environment in GitHub with required reviewers.
+    environment: terraform-production
+
+    # Prevent two deployment runs from reinitializing/applying state concurrently.
+    concurrency:
+      group: terraform-team-platform-production
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Plan and apply each team with isolated state
+        env:
+          TEAM_BATCH: ${{ toJSON(matrix.teams) }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r team; do
+            echo "Deploying team: $team"
+
+            terraform -chdir=live init -reconfigure \
+              -backend-config="bucket=$STATE_BUCKET" \
+              -backend-config="region=$AWS_REGION" \
+              -backend-config="key=teams/$team/terraform.tfstate" \
+              -backend-config="dynamodb_table=$LOCK_TABLE" \
+              -backend-config="encrypt=true"
+
+            terraform -chdir=live plan \
+              -lock-timeout=5m \
+              -var-file="$PLATFORM_CONFIG" \
+              -var-file="../teams/$team.tfvars" \
+              -out="$RUNNER_TEMP/$team.tfplan"
+
+            terraform -chdir=live apply \
+              -lock-timeout=5m \
+              -auto-approve \
+              "$RUNNER_TEMP/$team.tfplan"
+          done < <(jq -r '.[]' <<< "$TEAM_BATCH")

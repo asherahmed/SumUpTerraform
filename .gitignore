@@ -1,0 +1,11 @@
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+*.local.tfvars
+*.local.hcl
+.env
+.DS_Store
+# Commit .terraform.lock.hcl files after initialization.
