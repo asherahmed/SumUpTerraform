@@ -194,6 +194,9 @@ class DeploymentBoundaries(unittest.TestCase):
             self.assertIn("for file in teams/*.tfvars", code)
             self.assertIn('key=teams/$team/terraform.tfstate', code)
 
+    def test_feature_dispatch_cannot_replace_pending_main_deployment(self):
+        self.assertIn("github.ref", DEPLOY["concurrency"]["group"])
+
     def test_plan_artifact_exists_before_apply_approval(self):
         plan, apply = DEPLOY["jobs"]["plan"], DEPLOY["jobs"]["apply"]
         self.assertEqual(apply["needs"], "plan")

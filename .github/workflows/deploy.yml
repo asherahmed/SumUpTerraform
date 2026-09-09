@@ -12,7 +12,8 @@ permissions:
 # Pending runs may be replaced by GitHub. Every surviving run plans ALL teams, so
 # a skipped intermediate commit cannot strand a team changed only in that commit.
 concurrency:
-  group: terraform-team-platform-deployment
+  # A rejected feature-branch dispatch must not evict a pending main deployment.
+  group: terraform-team-platform-deployment-${{ github.ref }}
   cancel-in-progress: false
 
 env:
