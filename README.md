@@ -1,6 +1,6 @@
 # Terraform team platform
 
-A Terraform take-home implementation for self-service team S3 resources. A reusable module creates resources for one team at a time; each team owns a declaration file; production deployments use one remote Terraform state object per team.
+A Terraform take-home implementation for self-service team S3 resources. A reusable module creates resources for one team at a time; each team owns a declaration file; the repository includes a documented deployment template that uses one remote Terraform state object per team.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ This is deliberately not an all-team Terraform `for_each`: one Terraform executi
 ## Repository layout
 
 ```text
-.github/workflows/terraform.yml       CI: tests, detection, isolated deployment
+.github/workflows/terraform.yml       CI: tests, detection, and a commented deployment template
 modules/team-resources/               Reusable S3 and IAM module
   tests/team.tftest.hcl               Module contract tests with mocked AWS
 live/                                 Root configuration for one team execution
@@ -143,11 +143,11 @@ The workflow has four stages:
 1. `test` runs formatting, validation, and module mock tests for every pull request and push.
 2. `detect` compares Git changes. A change to `teams/payments.tfvars` selects Payments. A change to shared code under `modules/`, `live/`, `platform/`, or workflow files selects all teams.
 3. `mock_team_tests` runs the root mock test for each selected team. This runs on pull requests without AWS credentials.
-4. `deploy_changed_teams` runs only after a push to `main` or manual dispatch. It authenticates using GitHub OIDC, then initializes and applies each selected team using that team's unique backend key.
+4. `deploy_changed_teams` is a commented production deployment template. Enable it only after configuring the AWS backend, GitHub OIDC deployment role, GitHub Environment, and required repository values. When enabled, it runs after a push to `main` or manual dispatch and initializes/applies each selected team using that team's unique backend key.
 
 Teams are distributed over a maximum of 20 CI batches, with a maximum of five batches running concurrently. This avoids GitHub Actions' 256-job matrix limit while remaining workable for 300+ teams.
 
-The deployment loop is the state-isolation mechanism:
+When the deployment template is enabled, its loop provides state isolation:
 
 ```bash
 terraform -chdir=live init -reconfigure \
@@ -161,9 +161,9 @@ teams/payments/terraform.tfstate
 teams/fraud/terraform.tfstate
 ```
 
-The production job uses a protected GitHub Environment and workflow-level concurrency. The Environment should require a reviewer before Terraform applies changes. `cancel-in-progress: false` ensures GitHub does not cancel a running Terraform apply.
+The commented production template uses a protected GitHub Environment and workflow-level concurrency. The Environment should require a reviewer before Terraform applies changes. `cancel-in-progress: false` ensures GitHub does not cancel a running Terraform apply.
 
-## Real AWS prerequisites
+## Enabling real AWS deployment
 
 The backend is bootstrap infrastructure and must exist before team deployments. It is separate from the team state it stores.
 
