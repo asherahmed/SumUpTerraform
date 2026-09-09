@@ -171,72 +171,72 @@ jobs:
               -var-file="../teams/$team.tfvars"
           done < <(jq -r '.[]' <<< "$TEAM_BATCH")
 
-  deploy_changed_teams:
-    needs: [test, detect, mock_team_tests]
+  # deploy_changed_teams:
+  #   needs: [test, detect, mock_team_tests]
 
-    # Real AWS deployment never runs for pull requests.
-    if: |
-      needs.detect.outputs.has_changes == 'true' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+  #   # Real AWS deployment never runs for pull requests.
+  #   if: |
+  #     needs.detect.outputs.has_changes == 'true' &&
+  #     (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
 
-    runs-on: ubuntu-latest
+  #   runs-on: ubuntu-latest
 
-    # Configure this Environment in GitHub with required reviewers.
-    environment: terraform-production
+  #   # Configure this Environment in GitHub with required reviewers.
+  #   environment: terraform-production
 
-    # Prevent two deployment runs from reinitializing/applying state concurrently.
-    concurrency:
-      group: terraform-team-platform-production
-      cancel-in-progress: false
+  #   # Prevent two deployment runs from reinitializing/applying state concurrently.
+  #   concurrency:
+  #     group: terraform-team-platform-production
+  #     cancel-in-progress: false
 
-    strategy:
-      fail-fast: false
-      max-parallel: 5
-      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+  #   strategy:
+  #     fail-fast: false
+  #     max-parallel: 5
+  #     matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
 
-    steps:
-      - uses: actions/checkout@v4
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.9.8
+  #     - uses: hashicorp/setup-terraform@v3
+  #       with:
+  #         terraform_version: 1.9.8
 
-      - name: Authenticate to AWS with GitHub OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+  #     - name: Authenticate to AWS with GitHub OIDC
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN }}
+  #         aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Plan and apply each team with isolated state
-        env:
-          TEAM_BATCH: ${{ toJSON(matrix.teams) }}
-          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
+  #     - name: Plan and apply each team with isolated state
+  #       env:
+  #         TEAM_BATCH: ${{ toJSON(matrix.teams) }}
+  #         STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  #         LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+  #         AWS_REGION: ${{ vars.AWS_REGION }}
 
-        shell: bash
+  #       shell: bash
 
-        run: |
-          set -euo pipefail
+  #       run: |
+  #         set -euo pipefail
 
-          while IFS= read -r team; do
-            echo "Deploying team: $team"
+  #         while IFS= read -r team; do
+  #           echo "Deploying team: $team"
 
-            terraform -chdir=live init -reconfigure \
-              -backend-config="bucket=$STATE_BUCKET" \
-              -backend-config="region=$AWS_REGION" \
-              -backend-config="key=teams/$team/terraform.tfstate" \
-              -backend-config="dynamodb_table=$LOCK_TABLE" \
-              -backend-config="encrypt=true"
+  #           terraform -chdir=live init -reconfigure \
+  #             -backend-config="bucket=$STATE_BUCKET" \
+  #             -backend-config="region=$AWS_REGION" \
+  #             -backend-config="key=teams/$team/terraform.tfstate" \
+  #             -backend-config="dynamodb_table=$LOCK_TABLE" \
+  #             -backend-config="encrypt=true"
 
-            terraform -chdir=live plan \
-              -lock-timeout=5m \
-              -var-file="$PLATFORM_CONFIG" \
-              -var-file="../teams/$team.tfvars" \
-              -out="$RUNNER_TEMP/$team.tfplan"
+  #           terraform -chdir=live plan \
+  #             -lock-timeout=5m \
+  #             -var-file="$PLATFORM_CONFIG" \
+  #             -var-file="../teams/$team.tfvars" \
+  #             -out="$RUNNER_TEMP/$team.tfplan"
 
-            terraform -chdir=live apply \
-              -lock-timeout=5m \
-              -auto-approve \
-              "$RUNNER_TEMP/$team.tfplan"
-          done < <(jq -r '.[]' <<< "$TEAM_BATCH")
+  #           terraform -chdir=live apply \
+  #             -lock-timeout=5m \
+  #             -auto-approve \
+  #             "$RUNNER_TEMP/$team.tfplan"
+  #         done < <(jq -r '.[]' <<< "$TEAM_BATCH")
