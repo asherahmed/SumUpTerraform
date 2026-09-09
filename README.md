@@ -251,3 +251,19 @@ The deletion gate requires an explicitly reviewed exception for that final remov
 - https://developer.hashicorp.com/terraform/language/tests/mocking
 - https://developer.hashicorp.com/terraform/language/backend/s3
 - https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html
+# PR plan comments
+
+For same-repository pull requests, CI posts and updates one **mock plan preview**
+comment for the affected teams. `terraform test -verbose` shows the planned
+resources using mocked AWS; this is not a live AWS plan and does not compare
+against deployed state. Real saved plans remain in the opt-in deployment workflow.
+
+The comment includes check status and a link to full run output/artifacts. Large
+previews are truncated to fit GitHub's comment limit; full artifacts are retained
+for three days. Failed tests also upload their output, and still fail CI. An older
+commit's run skips commenting if the PR head has moved on.
+
+Only the separate commenting job gets `pull-requests: write`; it does not check out
+or execute repository code or use AWS credentials. Fork PRs skip commenting because
+their tokens are read-only, but still generate previews and artifacts. No
+`pull_request_target` workflow is used.
