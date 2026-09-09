@@ -2,6 +2,16 @@
 # Detailed security-policy assertions live in the module's fixed-fixture tests.
 mock_provider "aws" {}
 
+# Negative contract test: the filename/state identity must win over declaration mistakes.
+run "reject_identity_mismatch" {
+  command = plan
+  variables {
+    expected_team_name = "expected-team"
+    team_name          = "other-team"
+  }
+  expect_failures = [var.team_name]
+}
+
 run "team_declaration" {
   command = plan
   assert {

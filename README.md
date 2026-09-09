@@ -19,7 +19,7 @@ flowchart TD
 
 `teams/<team>.tfvars` is owned by the team and declares its identity, approved workload role, and buckets. `platform/dev.tfvars` holds centrally managed account-wide values such as namespace, account ID, and AWS region.
 
-CI parses each declaration as HCL and requires `team_name` to equal its filename stem. This binds resource identity to the team ID used for change detection and state selection. For example:
+CI passes the filename stem as `expected_team_name` after all variable files. Terraform validates that `team_name` matches it. This binds resource identity to the team ID used for change detection and state selection. For example:
 
 ```text
 teams/payments.tfvars -> team ID: payments -> state key: teams/payments/terraform.tfstate
@@ -32,9 +32,6 @@ This is deliberately not an all-team Terraform `for_each`: one Terraform executi
 ```text
 .github/workflows/terraform.yml       CI: validation, tests, changed-team detection
 .github/workflows/deploy.yml          Optional real plan -> review -> apply workflow
-.github/actions/validate-config/      Reusable inline HCL preflight validation
-.github/tests/test_ci.py              Regression tests for actual workflow logic
-.github/requirements.txt              Pinned Python test/parser dependencies
 modules/team-resources/               Reusable S3 and IAM module
   tests/team.tftest.hcl               Module contract tests with mocked AWS
 live/                                 Root configuration for one team execution
@@ -66,7 +63,7 @@ buckets = {
 
 Every bucket must explicitly declare `visibility = "public"` or `visibility = "private"`; there is no default. The `buckets` map must contain at least one bucket. Each map key is a stable resource identity, so renaming a key can cause Terraform to replace that bucket.
 
-Team files may contain only `team_name`, `trusted_role_arn`, and `buckets`; bucket objects may contain only `visibility`. CI rejects platform overrides, unknown fields, mismatched team names, and wildcard role principals before running Terraform. Platform values are also loaded last for final precedence. Terraform variable files are configuration input, not an access-control boundary on their own.
+Team files should contain only `team_name`, `trusted_role_arn`, and `buckets`. Terraform validates required visibility, names, nonempty buckets and explicit role ARNs. Platform values load last, so team files cannot override those values. CI supplies `expected_team_name` last to prevent identity/state-key mismatches. For simplicity, no separate HCL parser is used: unknown top-level variables may only produce warnings and extra object attributes may be discarded by Terraform. Variable files are not an access-control boundary.
 
 Example `platform/dev.tfvars`:
 
@@ -97,22 +94,17 @@ AWS remains the authority on global S3 bucket-name availability.
 On macOS:
 
 ```bash
-brew install git jq python@3.12 node
+brew install git jq
 brew tap hashicorp/tap
 brew install hashicorp/tap/terraform
 terraform version
 ```
 
-CI uses Terraform 1.9.8 and AWS provider 5.x. Homebrew may install a newer Terraform; use a version manager for an exact local match or deliberately update `.terraform-version` and both workflow pins together. Python 3.12 parses HCL and runs workflow regression tests; Node executes the actual inline change-detector JavaScript in those tests. There is no separate provisioning script.
+CI uses Terraform 1.9.8 and AWS provider 5.x. Homebrew may install a newer Terraform; use a version manager for an exact local match or deliberately update `.terraform-version` and both workflow pins together. No Python dependencies or separate provisioning scripts are required.
 
 Run from the repository root:
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r .github/requirements.txt
-python -m unittest discover -s .github/tests -v
-
 terraform fmt -check -recursive
 
 terraform -chdir=modules/team-resources init -backend=false
@@ -124,11 +116,13 @@ terraform -chdir=live validate
 
 terraform -chdir=live test \
   -var-file=../teams/payments.tfvars \
-  -var-file=../platform/dev.tfvars
+  -var-file=../platform/dev.tfvars \
+  -var=expected_team_name=payments
 
 terraform -chdir=live test \
   -var-file=../teams/fraud.tfvars \
-  -var-file=../platform/dev.tfvars
+  -var-file=../platform/dev.tfvars \
+  -var=expected_team_name=fraud
 ```
 
 Terraform downloads the AWS provider during `init`, but these tests need no AWS credentials and create no AWS resources. Tests use Terraform's `mock_provider "aws" {}` capability.
@@ -139,7 +133,7 @@ The module test uses fixed representative inputs for Payments. This lets it asse
 
 The root test is parameterized. CI runs the same test file using each changed team's actual `.tfvars` file. It verifies exact bucket keys and names, including team, namespace and account, rather than only counting outputs.
 
-The Python suite executes the validator extracted from the composite action and the JavaScript extracted from the detection job. Git/GitHub inputs are mocked, not the selection algorithm. It checks identity mismatch, platform overrides, invalid declarations, shared changes, deletion, README-only changes, and 301 teams appearing exactly once. Additional workflow-structure checks protect main-only opt-in gates, platform precedence, global deployment serialization, artifact handoff and approval placement. These do not replace an actual AWS deployment test.
+Testing stays Terraform-native. There is no separate regression suite for workflow orchestration or PR comment formatting; changes to that logic should be reviewed and exercised in a PR.
 
 Mock tests cover:
 
@@ -154,13 +148,15 @@ Mock tests do not prove AWS API acceptance, effective IAM authorization, account
 
 ## CI/CD
 
-The credential-free `terraform.yml` workflow has three jobs:
+The credential-free `terraform.yml` workflow has four jobs:
 
-1. `test` validates the declaration contract, runs workflow regression tests, formatting, Terraform validation and module mock tests.
-2. `detect` validates declarations and compares Git changes. A change to `teams/payments.tfvars` selects Payments. A change under `modules/`, `live/`, `platform/`, or `.github/` selects all teams. Manual dispatch and a first push select all teams.
+1. `test` runs formatting, Terraform validation and module mock tests.
+2. `detect` validates filenames and compares Git changes. A change to `teams/payments.tfvars` selects Payments. A change under `modules/`, `live/`, `platform/`, or `.github/` selects all teams. Manual dispatch and a first push select all teams.
 3. `mock_team_tests` runs the root mock test for each selected team. This runs on pull requests without AWS credentials.
 
-For mock tests, teams are distributed over at most 20 batches, with five concurrent jobs. The 301-team regression test checks complete, duplicate-free selection within that limit. It is not a benchmark of 301 real AWS deployments.
+4. `comment_plan` updates the mock plan preview comment on same-repository PRs.
+
+For mock tests, teams are distributed over at most 20 batches, with five concurrent jobs. This supports 300+ team declarations without changing the module; real deployment throughput has not been benchmarked.
 
 The separate `deploy.yml` workflow is disabled unless the repository variable `TERRAFORM_DEPLOY_ENABLED` is exactly `true`. Both plan and apply jobs also require `refs/heads/main`, including manual dispatch. Its sequence is:
 

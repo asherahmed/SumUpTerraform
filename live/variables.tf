@@ -1,7 +1,17 @@
+variable "expected_team_name" {
+  type        = string
+  default     = null
+  description = "Filename stem passed last by CI to bind resource identity to its state key. Local callers should also supply it."
+}
+
 variable "team_name" {
   type        = string
   description = "Team identifier declared in the team file; CI verifies it matches the filename."
   nullable    = false
+  validation {
+    condition     = var.expected_team_name == null || var.team_name == var.expected_team_name
+    error_message = "team_name must match the team declaration filename used for state selection."
+  }
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,14}[a-z0-9]$", var.team_name))
     error_message = "Team names must be 2-16 lowercase letters, digits or hyphens; start with a letter and end alphanumeric."
@@ -33,7 +43,7 @@ variable "trusted_role_arn" {
   description = "Platform-approved existing workload role that may assume this team's role."
   nullable    = false
   validation {
-    condition     = can(regex("^arn:aws:iam::[0-9]{12}:role/.+$", var.trusted_role_arn))
+    condition     = can(regex("^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]+$", var.trusted_role_arn))
     error_message = "Use an explicit commercial AWS IAM role ARN, not a wildcard or account root."
   }
 }

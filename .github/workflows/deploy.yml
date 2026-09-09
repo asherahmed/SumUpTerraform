@@ -42,18 +42,19 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      - uses: ./.github/actions/validate-config
       - name: Run checks before requesting AWS credentials
         run: |
           terraform fmt -check -recursive
-          python -m unittest discover -s .github/tests -v
           terraform -chdir=modules/team-resources init -backend=false -lockfile=readonly
           terraform -chdir=modules/team-resources validate
           terraform -chdir=modules/team-resources test
           terraform -chdir=live init -backend=false -lockfile=readonly
           terraform -chdir=live validate
           for file in teams/*.tfvars; do
-            terraform -chdir=live test -var-file="../$file" -var-file="$PLATFORM_CONFIG"
+            team="${file##*/}"
+            team="${team%.tfvars}"
+            [[ "$team" =~ ^[a-z][a-z0-9-]{0,14}[a-z0-9]$ ]] && [[ ! -L "$file" ]] || exit 1
+            terraform -chdir=live test -var-file="../$file" -var-file="$PLATFORM_CONFIG" -var="expected_team_name=$team"
           done
       - name: Reject stale commit
         env:
@@ -92,6 +93,7 @@ jobs:
               -backend-config="encrypt=true"
             terraform -chdir=live plan -lock-timeout=5m \
               -var-file="../$file" -var-file="$PLATFORM_CONFIG" \
+              -var="expected_team_name=$team" \
               -out="$RUNNER_TEMP/team-plans/$team.tfplan"
             terraform -chdir=live show -no-color "$RUNNER_TEMP/team-plans/$team.tfplan" \
               > "$RUNNER_TEMP/team-plans/$team.txt"

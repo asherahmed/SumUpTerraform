@@ -33,7 +33,7 @@ variable "trusted_role_arn" {
   description = "Platform-approved existing workload role that may assume this team's role."
   nullable    = false
   validation {
-    condition     = can(regex("^arn:aws:iam::[0-9]{12}:role/.+$", var.trusted_role_arn))
+    condition     = can(regex("^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]+$", var.trusted_role_arn))
     error_message = "Use an explicit commercial AWS IAM role ARN, not a wildcard or account root."
   }
 }
