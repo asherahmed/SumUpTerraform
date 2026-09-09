@@ -1,6 +1,6 @@
 variable "team_name" {
   type        = string
-  description = "Stable team identifier, derived from the team filename by CI."
+  description = "Stable team identifier supplied by the caller."
   nullable    = false
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,14}[a-z0-9]$", var.team_name))

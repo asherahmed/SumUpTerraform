@@ -1,0 +1,178 @@
+name: Terraform deployment (opt-in)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Lock the entire plan -> approval -> apply sequence, not individual matrix jobs.
+# Pending runs may be replaced by GitHub. Every surviving run plans ALL teams, so
+# a skipped intermediate commit cannot strand a team changed only in that commit.
+concurrency:
+  group: terraform-team-platform-deployment
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  PLATFORM_CONFIG: ../platform/dev.tfvars
+  TF_WORKSPACE: default
+
+jobs:
+  plan:
+    # No AWS access unless a maintainer explicitly opts in. Dispatching a feature
+    # branch cannot pass this guard, even if the enable variable is set.
+    if: vars.TERRAFORM_DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: terraform-plan
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      artifact_id: ${{ steps.plans.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - uses: ./.github/actions/validate-config
+      - name: Run checks before requesting AWS credentials
+        run: |
+          terraform fmt -check -recursive
+          python -m unittest discover -s .github/tests -v
+          terraform -chdir=modules/team-resources init -backend=false -lockfile=readonly
+          terraform -chdir=modules/team-resources validate
+          terraform -chdir=modules/team-resources test
+          terraform -chdir=live init -backend=false -lockfile=readonly
+          terraform -chdir=live validate
+          for file in teams/*.tfvars; do
+            terraform -chdir=live test -var-file="../$file" -var-file="$PLATFORM_CONFIG"
+          done
+      - name: Reject stale commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$EXPECTED_SHA" || {
+            echo 'main advanced; use a deployment of the latest commit.' >&2
+            exit 1
+          }
+      - name: Authenticate for planning
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Plan every team into separate saved plans
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${STATE_BUCKET:?Set TF_STATE_BUCKET}" "${LOCK_TABLE:?Set TF_LOCK_TABLE}" "${AWS_REGION:?Set AWS_REGION}"
+          mkdir -p "$RUNNER_TEMP/team-plans"
+          for file in teams/*.tfvars; do
+            team="${file##*/}"
+            team="${team%.tfvars}"
+            # Reconfigure switches backend metadata between teams in this runner.
+            # Each team retains the existing key; do not migrate state implicitly.
+            terraform -chdir=live init -reconfigure -lockfile=readonly \
+              -backend-config="bucket=$STATE_BUCKET" \
+              -backend-config="region=$AWS_REGION" \
+              -backend-config="key=teams/$team/terraform.tfstate" \
+              -backend-config="dynamodb_table=$LOCK_TABLE" \
+              -backend-config="encrypt=true"
+            terraform -chdir=live plan -lock-timeout=5m \
+              -var-file="../$file" -var-file="$PLATFORM_CONFIG" \
+              -out="$RUNNER_TEMP/team-plans/$team.tfplan"
+            terraform -chdir=live show -no-color "$RUNNER_TEMP/team-plans/$team.tfplan" \
+              > "$RUNNER_TEMP/team-plans/$team.txt"
+          done
+          # Bind the artifact to the commit and backend used at plan time.
+          jq -n --arg sha "$EXPECTED_SHA" --arg bucket "$STATE_BUCKET" \
+            --arg region "$AWS_REGION" --arg table "$LOCK_TABLE" \
+            '{sha:$sha,state_bucket:$bucket,region:$region,lock_table:$table}' \
+            > "$RUNNER_TEMP/team-plans/manifest.json"
+      - uses: actions/upload-artifact@v4
+        id: plans
+        with:
+          name: team-plans-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/team-plans/
+          if-no-files-found: error
+          retention-days: 3
+      - name: Tell reviewer where to find the plans
+        env:
+          PLAN_URL: ${{ steps.plans.outputs.artifact-url }}
+        run: |
+          echo "Review each team's .txt plan in [the saved plan artifact]($PLAN_URL) before approving terraform-production." >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    needs: plan
+    if: vars.TERRAFORM_DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    # Configure required reviewers here; approval happens AFTER plans are uploaded.
+    environment: terraform-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/team-plans
+      - name: Reject stale commit and changed backend settings
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$EXPECTED_SHA"
+          jq -e --arg sha "$EXPECTED_SHA" --arg bucket "$STATE_BUCKET" \
+            --arg region "$AWS_REGION" --arg table "$LOCK_TABLE" \
+            '.sha == $sha and .state_bucket == $bucket and .region == $region and .lock_table == $table' \
+            "$RUNNER_TEMP/team-plans/manifest.json"
+      - name: Authenticate for applying the reviewed plans
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Apply the saved plan for every team
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in teams/*.tfvars; do
+            # A newer main during approval or a long apply must not be overwritten.
+            # If this fails mid-run, re-plan all teams from the new main commit.
+            test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$EXPECTED_SHA"
+            team="${file##*/}"
+            team="${team%.tfvars}"
+            terraform -chdir=live init -reconfigure -lockfile=readonly \
+              -backend-config="bucket=$STATE_BUCKET" \
+              -backend-config="region=$AWS_REGION" \
+              -backend-config="key=teams/$team/terraform.tfstate" \
+              -backend-config="dynamodb_table=$LOCK_TABLE" \
+              -backend-config="encrypt=true"
+            # No re-plan after approval. Terraform rejects a stale state snapshot.
+            terraform -chdir=live apply -lock-timeout=5m "$RUNNER_TEMP/team-plans/$team.tfplan"
+          done

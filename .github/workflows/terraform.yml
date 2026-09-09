@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Required for GitHub Actions OIDC to AWS.
 
 env:
   TF_IN_AUTOMATION: "true"
@@ -25,6 +24,11 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
+
+      - uses: ./.github/actions/validate-config
+
+      - name: Run workflow regression tests
+        run: python -m unittest discover -s .github/tests -v
 
       - run: terraform fmt -check -recursive
 
@@ -47,6 +51,8 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: ./.github/actions/validate-config
+
       - uses: actions/github-script@v7
         id: teams
         with:
@@ -56,6 +62,7 @@ jobs:
             const git = (...args) =>
               execFileSync('git', args, { encoding: 'utf8' });
 
+            // NUL delimiters keep filenames intact; preflight rejects invalid IDs.
             const all = git('ls-files', '-z', 'teams/*.tfvars')
               .split('\0')
               .filter(Boolean);
@@ -66,6 +73,7 @@ jobs:
               }
             }
 
+            // Dispatch and a first push reconcile every declaration.
             let selected = all;
 
             if (context.eventName !== 'workflow_dispatch') {
@@ -103,7 +111,7 @@ jobs:
 
                 const shared = changed.some(
                   file =>
-                    /^(modules\/|live\/|platform\/|\.github\/workflows\/)/.test(file) ||
+                    /^(modules\/|live\/|platform\/|\.github\/)/.test(file) ||
                     file === '.terraform-version'
                 );
 
@@ -167,76 +175,6 @@ jobs:
             echo "Mock-testing team: $team"
 
             terraform -chdir=live test \
-              -var-file="$PLATFORM_CONFIG" \
-              -var-file="../teams/$team.tfvars"
+              -var-file="../teams/$team.tfvars" \
+              -var-file="$PLATFORM_CONFIG"
           done < <(jq -r '.[]' <<< "$TEAM_BATCH")
-
-  # deploy_changed_teams:
-  #   needs: [test, detect, mock_team_tests]
-
-  #   # Real AWS deployment never runs for pull requests.
-  #   if: |
-  #     needs.detect.outputs.has_changes == 'true' &&
-  #     (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-
-  #   runs-on: ubuntu-latest
-
-  #   # Configure this Environment in GitHub with required reviewers.
-  #   environment: terraform-production
-
-  #   # Prevent two deployment runs from reinitializing/applying state concurrently.
-  #   concurrency:
-  #     group: terraform-team-platform-production
-  #     cancel-in-progress: false
-
-  #   strategy:
-  #     fail-fast: false
-  #     max-parallel: 5
-  #     matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
-
-  #   steps:
-  #     - uses: actions/checkout@v4
-
-  #     - uses: hashicorp/setup-terraform@v3
-  #       with:
-  #         terraform_version: 1.9.8
-
-  #     - name: Authenticate to AWS with GitHub OIDC
-  #       uses: aws-actions/configure-aws-credentials@v4
-  #       with:
-  #         role-to-assume: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN }}
-  #         aws-region: ${{ vars.AWS_REGION }}
-
-  #     - name: Plan and apply each team with isolated state
-  #       env:
-  #         TEAM_BATCH: ${{ toJSON(matrix.teams) }}
-  #         STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-  #         LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
-  #         AWS_REGION: ${{ vars.AWS_REGION }}
-
-  #       shell: bash
-
-  #       run: |
-  #         set -euo pipefail
-
-  #         while IFS= read -r team; do
-  #           echo "Deploying team: $team"
-
-  #           terraform -chdir=live init -reconfigure \
-  #             -backend-config="bucket=$STATE_BUCKET" \
-  #             -backend-config="region=$AWS_REGION" \
-  #             -backend-config="key=teams/$team/terraform.tfstate" \
-  #             -backend-config="dynamodb_table=$LOCK_TABLE" \
-  #             -backend-config="encrypt=true"
-
-  #           terraform -chdir=live plan \
-  #             -lock-timeout=5m \
-  #             -var-file="$PLATFORM_CONFIG" \
-  #             -var-file="../teams/$team.tfvars" \
-  #             -out="$RUNNER_TEMP/$team.tfplan"
-
-  #           terraform -chdir=live apply \
-  #             -lock-timeout=5m \
-  #             -auto-approve \
-  #             "$RUNNER_TEMP/$team.tfplan"
-  #         done < <(jq -r '.[]' <<< "$TEAM_BATCH")
